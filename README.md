@@ -1,6 +1,6 @@
 # cortexproject/homebrew-tap
 
-Homebrew formulae for [Cortex](https://cortexproject.io) tooling.
+Homebrew formulae for [Cortex](https://cortexmetrics.io) tooling.
 
 Currently just [`cortextool`](https://github.com/cortexproject/cortex-tools). Other
 `cortex-tools` binaries — `benchtool` and friends — can join this tap later.
