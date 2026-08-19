@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Style and audit
+    runs-on: ubuntu-24.04
+    steps:
+      # There is no `actions/checkout` step on purpose: `setup-homebrew` checks
+      # this repository out itself, into both `$GITHUB_WORKSPACE` and Homebrew's
+      # taps directory, and trusts the tap so `brew` will load the formula.
+      - name: Set up Homebrew
+        id: set-up-homebrew
+        uses: Homebrew/actions/setup-homebrew@8f3d1ec8a696b3b9d9a6c3696b6c73033cab69e4 # 2026.08.14.1
+
+      - name: brew style
+        run: brew style "${{ steps.set-up-homebrew.outputs.tap-name }}"
+
+      - name: brew audit
+        run: brew audit --strict "${{ steps.set-up-homebrew.outputs.tap-name }}/cortextool"
+
+  test:
+    name: ${{ matrix.os }}
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15 # arm64
+          - macos-15-intel # x86_64
+          - ubuntu-24.04 # x86_64
+          - ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Set up Homebrew
+        id: set-up-homebrew
+        uses: Homebrew/actions/setup-homebrew@8f3d1ec8a696b3b9d9a6c3696b6c73033cab69e4 # 2026.08.14.1
+
+      - name: brew install --build-from-source
+        run: brew install --build-from-source --verbose "${{ steps.set-up-homebrew.outputs.tap-name }}/cortextool"
+
+      - name: brew test
+        run: brew test --verbose "${{ steps.set-up-homebrew.outputs.tap-name }}/cortextool"
+
+      - name: brew linkage
+        run: brew linkage --test "${{ steps.set-up-homebrew.outputs.tap-name }}/cortextool"

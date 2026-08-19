@@ -1,0 +1,156 @@
+name: Update cortextool
+
+on:
+  schedule:
+    # cortex-tools sends a `repository_dispatch` when it publishes a release, so
+    # this schedule only matters when that notification never arrives — the token
+    # is unset or expired, or the job failed.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to bump to, e.g. v0.22.0. Defaults to whatever brew livecheck finds."
+        required: false
+        type: string
+  repository_dispatch:
+    types:
+      - cortextool-release
+
+permissions:
+  contents: read
+
+concurrency:
+  # A release notification and the schedule can easily overlap; never let two
+  # bumps race to push the same formula.
+  group: update-cortextool
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Write the bump
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - name: Set up Homebrew
+        id: set-up-homebrew
+        uses: Homebrew/actions/setup-homebrew@8f3d1ec8a696b3b9d9a6c3696b6c73033cab69e4 # 2026.08.14.1
+
+      - name: Find and write the new version
+        id: bump
+        env:
+          TAP: ${{ steps.set-up-homebrew.outputs.tap-name }}
+          # Whichever of the two trigger payloads carries a tag, if either does.
+          REQUESTED_TAG: ${{ github.event.inputs.tag || github.event.client_payload.tag }}
+        run: |
+          current=$(brew info --json=v2 "$TAP/cortextool" | jq -r '.formulae[0].versions.stable')
+
+          if [ -n "$REQUESTED_TAG" ]; then
+            target=${REQUESTED_TAG#v}
+          else
+            # `--newer-only` prints `[]` when the formula is already current.
+            target=$(brew livecheck --tap="$TAP" --newer-only --json |
+              jq -r '.[] | select(.formula == "cortextool") | .version.latest')
+          fi
+
+          if [ -z "$target" ] || [ "$target" = "$current" ]; then
+            echo "cortextool $current is already current; nothing to do."
+            exit 0
+          fi
+
+          echo "Bumping cortextool $current -> $target"
+          # Rewrites `url` and `sha256` in place and takes no git actions.
+          brew bump-formula-pr --write-only --no-audit --version="$target" "$TAP/cortextool"
+          brew style "$TAP"
+          brew audit --strict "$TAP/cortextool"
+
+          echo "version=$target" >>"$GITHUB_OUTPUT"
+
+      - name: Upload the bumped formula
+        if: steps.bump.outputs.version != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: formula
+          path: Formula/cortextool.rb
+          if-no-files-found: error
+
+  test:
+    name: ${{ matrix.os }}
+    needs: bump
+    if: needs.bump.outputs.version != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15 # arm64
+          - macos-15-intel # x86_64
+          - ubuntu-24.04 # x86_64
+          - ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Set up Homebrew
+        id: set-up-homebrew
+        uses: Homebrew/actions/setup-homebrew@8f3d1ec8a696b3b9d9a6c3696b6c73033cab69e4 # 2026.08.14.1
+
+      - name: Download the bumped formula
+        uses: actions/download-artifact@v8
+        with:
+          name: formula
+          path: ${{ runner.temp }}/bump
+
+      - name: Apply the bumped formula
+        env:
+          TAP: ${{ steps.set-up-homebrew.outputs.tap-name }}
+        run: |
+          cp "$RUNNER_TEMP/bump/cortextool.rb" "$(brew --repository "$TAP")/Formula/cortextool.rb"
+          git -C "$(brew --repository "$TAP")" --no-pager diff
+
+      - name: brew install --build-from-source
+        run: brew install --build-from-source --verbose "${{ steps.set-up-homebrew.outputs.tap-name }}/cortextool"
+
+      - name: brew test
+        run: brew test --verbose "${{ steps.set-up-homebrew.outputs.tap-name }}/cortextool"
+
+      - name: brew linkage
+        run: brew linkage --test "${{ steps.set-up-homebrew.outputs.tap-name }}/cortextool"
+
+  commit:
+    name: Commit to main
+    # `test` uses `fail-fast: false`, so this waits for every platform and is
+    # skipped unless all of them passed. That all-or-nothing gate is the point:
+    # a bump nobody has built anywhere must never reach `main`.
+    needs:
+      - bump
+      - test
+    if: needs.bump.outputs.version != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v7
+
+      - name: Download the bumped formula
+        uses: actions/download-artifact@v8
+        with:
+          name: formula
+          path: ${{ runner.temp }}/bump
+
+      - name: Commit the bump
+        env:
+          VERSION: ${{ needs.bump.outputs.version }}
+        run: |
+          cp "$RUNNER_TEMP/bump/cortextool.rb" Formula/cortextool.rb
+
+          if git diff --quiet -- Formula/cortextool.rb; then
+            echo "Formula/cortextool.rb already matches; nothing to commit."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit \
+            -m "cortextool $VERSION" \
+            -m "Built and \`brew test\`ed on macOS arm64, macOS x86_64, Linux x86_64 and Linux arm64." \
+            -- Formula/cortextool.rb
+          git push
